@@ -29,6 +29,7 @@ interface GuildSession {
     userId: string
     sendChannelId: string
     guildId: string
+    originalIndex: number // 追加: 元の順序を保持
   }[]
   isQueueProcessing: boolean
   option: TranscriptionOption
@@ -45,6 +46,7 @@ interface GuildSession {
   subscribedUsers: Set<string>
   activeStreams: Map<string, AudioReceiveStream>
   lastUsedChannelId?: string
+  queueCounter: number // 追加: キューの連番管理
 }
 
 export default class Transcription extends BaseModule {
@@ -134,6 +136,7 @@ export default class Transcription extends BaseModule {
         sessionStartTime: Date.now(),
         subscribedUsers: new Set(),
         activeStreams: new Map(),
+        queueCounter: 0, // 追加: カウンター初期化
       }
       this.guildSessions.set(guildId, session)
     }
@@ -247,11 +250,13 @@ export default class Transcription extends BaseModule {
           opusStream.destroy()
           await this.encodePcmToWav(guildId, uuid)
           if (this.isValidVoiceData(guildId, uuid)) {
+            // 順序番号を付与してキューに追加
             session.queue.push({
               uuid: uuid,
               userId: userId,
               sendChannelId: connection.joinConfig.channelId,
               guildId: guildId,
+              originalIndex: session.queueCounter++, // 追加: 順序番号
             })
             if (!session.isQueueProcessing) await this.progressQueue(guildId)
           }
@@ -481,45 +486,84 @@ export default class Transcription extends BaseModule {
   private async progressQueue(guildId: string): Promise<void> {
     const session = this.getOrCreateGuildSession(guildId)
     session.isQueueProcessing = true
-    const completedItem = session.queue.shift()
-    if (completedItem) {
-      const context = await this.transcribeAudio(
-        completedItem.guildId,
-        completedItem.uuid,
+    
+    // 並列処理用の設定
+    const maxConcurrentTranscriptions = 3 // 同時処理数
+    const batchSize = Math.min(maxConcurrentTranscriptions, session.queue.length)
+    
+    if (batchSize === 0) {
+      session.isQueueProcessing = false
+      return
+    }
+    
+    // バッチで処理（元の順序インデックスを保持）
+    const batch = session.queue.splice(0, batchSize)
+    const transcriptionPromises = batch.map(async (item) => {
+      const context = await this.transcribeAudio(item.guildId, item.uuid)
+      return { 
+        item, 
+        context, 
+        originalIndex: item.originalIndex // 元の順序インデックスを保持
+      }
+    })
+    
+    try {
+      const results = await Promise.all(transcriptionPromises)
+      
+      // 元の順序でソート（originalIndexで並び替え）
+      results.sort((a, b) => a.originalIndex - b.originalIndex)
+      
+      console.log(
+        `[discord-whisper]Processing ${results.length} transcription results in original order: ${results.map(r => r.originalIndex).join(', ')}`
       )
-      if (context) {
-        if (completedItem.sendChannelId && session.option.sendRealtimeMessage) {
-          const channel = await this.client.channels.fetch(
-            completedItem.sendChannelId,
+      
+      // 順序を保持して処理
+      for (const { item, context } of results) {
+        if (context) {
+          console.log(
+            `[discord-whisper]Processing transcription in order - Index: ${item.originalIndex}, Content: "${context.substring(0, 50)}..."`
           )
-          if (channel?.isVoiceBased()) {
-            const webhook = await this.fetchWebhook(channel)
-            if (webhook) {
-              await this.sendWebhookMessage(
-                webhook,
-                completedItem.userId,
-                context,
-              )
+          
+          // リアルタイムメッセージ送信（順序保持）
+          if (item.sendChannelId && session.option.sendRealtimeMessage) {
+            const channel = await this.client.channels.fetch(item.sendChannelId)
+            if (channel?.isVoiceBased()) {
+              const webhook = await this.fetchWebhook(channel)
+              if (webhook) {
+                await this.sendWebhookMessage(webhook, item.userId, context)
+              }
             }
           }
-        }
-        if (session.option.exportReport) {
-          const user = await this.client.users.fetch(completedItem.userId)
-          // 録音データから開始時刻情報を取得
-          const recording = session.audioRecordings.find(r => r.uuid === completedItem.uuid)
-          let timeInfo = ''
-          if (recording) {
-            const startTime = new Date(recording.startTime).toLocaleString('ja-JP')
-            timeInfo = ` [${startTime}]`
-          }
           
-          session.report += `User: ${user.displayName}(ID:${completedItem.userId})${timeInfo}\n`
-          session.report += `Transcription: ${context}\n\n`
+          // レポート追加（順序保持）
+          if (session.option.exportReport) {
+            const user = await this.client.users.fetch(item.userId)
+            const recording = session.audioRecordings.find(r => r.uuid === item.uuid)
+            let timeInfo = ''
+            if (recording) {
+              const startTime = new Date(recording.startTime).toLocaleString('ja-JP')
+              timeInfo = ` [${startTime}]`
+            }
+            
+            session.report += `User: ${user.displayName}(ID:${item.userId})${timeInfo}\n`
+            session.report += `Transcription: ${context}\n\n`
+          }
+        } else {
+          console.log(
+            `[discord-whisper]Skipping invalid transcription - Index: ${item.originalIndex}`
+          )
         }
       }
+    } catch (error) {
+      console.error('[discord-whisper]Error in batch transcription:', error)
     }
-    if (session.queue.length > 0) void this.progressQueue(guildId)
-    else session.isQueueProcessing = false
+    
+    // 残りのキューがある場合は再帰処理
+    if (session.queue.length > 0) {
+      void this.progressQueue(guildId)
+    } else {
+      session.isQueueProcessing = false
+    }
   }
 
   private isValidVoiceData(guildId: string, uuid: string): boolean {
